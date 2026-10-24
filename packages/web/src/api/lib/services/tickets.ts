@@ -30,8 +30,9 @@ export async function placeTicket(tx: Db, member: Member, projectId: number, amo
   const project = await lockProject(tx, projectId);
   const [fresh] = await tx.select().from(schema.members).where(eq(schema.members.id, member.id));
 
-  if (project.status !== "live" && project.status !== "funded") {
-    throw new ORPCError("BAD_REQUEST", { message: "This round is not taking tickets" });
+  // "funded" means every stage is verified: a new ticket would have no stage left to release it.
+  if (project.status !== "live") {
+    throw new ORPCError("BAD_REQUEST", { message: project.status === "funded" ? "All five stages are verified — this round is closed to new tickets. Look for equity on the Equity Book." : "This round is not taking tickets" });
   }
   if (project.creatorId === fresh.id) {
     throw new ORPCError("BAD_REQUEST", { message: "You cannot back your own project" });

@@ -2,38 +2,46 @@ import { z } from "zod";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { ORPCError } from "@orpc/server";
 import { logDecision } from "../lib/log";
-import { base } from "../middleware/errors";
+import { actorOf, memberProc, publicProc, signedIn, type Member } from "../middleware/auth";
 import { db } from "../database/client";
 import * as schema from "../database/schema";
-import {
-  LEVELS,
-  ONGOING_UNLOCK_CENTS,
-  levelConfig,
-  scoreBand,
-  trustFactors,
-  weekKey,
-} from "../lib/economy";
-import { addLedger, addNotice, debitWallet, getMember, takeHouseFee } from "../lib/helpers";
+import { LEVELS, ONGOING_UNLOCK_CENTS, levelConfig, scoreBand, trustFactors, weekKey } from "../lib/economy";
+import { audit, audited } from "../lib/services/audit";
+import { idempotencyKey, isUniqueViolation, once } from "../lib/services/idempotency";
+import { addLedger, chargeService } from "../lib/services/ledger";
+import { addNotice } from "../lib/services/notices";
+import { isAccredited } from "../lib/services/tickets";
+import { runTx, type Db } from "../lib/services/tx";
+import { spendPoints } from "../lib/services/wallet";
 
 const worldEnum = z.enum(["underground", "lab", "prestige"]);
 const brandEnum = z.enum(["forge", "orbital", "sole", "hub"]);
 
-async function memberStats(memberId: number) {
+/** Fields any visitor may see about a member. Never wallet, email or identity status. */
+const publicColumns = {
+  id: schema.members.id,
+  handle: schema.members.handle,
+  displayName: schema.members.displayName,
+  role: schema.members.role,
+  level: schema.members.level,
+  clout: schema.members.clout,
+  homeBrand: schema.members.homeBrand,
+  bio: schema.members.bio,
+  createdAt: schema.members.createdAt,
+};
+
+async function memberStats(tx: Db, memberId: number) {
   const [draws, investments, tasks, notices, verified] = await Promise.all([
-    db.select().from(schema.draws).where(eq(schema.draws.memberId, memberId)),
-    db.select().from(schema.investments).where(eq(schema.investments.memberId, memberId)),
-    db.select().from(schema.tasks).where(eq(schema.tasks.memberId, memberId)),
-    db
-      .select()
-      .from(schema.notices)
-      .where(and(eq(schema.notices.memberId, memberId), eq(schema.notices.resolved, false))),
-    db
+    tx.select().from(schema.draws).where(eq(schema.draws.memberId, memberId)),
+    tx.select().from(schema.investments).where(and(eq(schema.investments.memberId, memberId), eq(schema.investments.kind, "primary"))),
+    tx.select().from(schema.tasks).where(eq(schema.tasks.memberId, memberId)),
+    tx.select().from(schema.notices).where(and(eq(schema.notices.memberId, memberId), eq(schema.notices.resolved, false))),
+    tx
       .select({ count: sql<number>`count(*)` })
       .from(schema.milestones)
       .innerJoin(schema.projects, eq(schema.milestones.projectId, schema.projects.id))
       .where(and(eq(schema.projects.creatorId, memberId), eq(schema.milestones.status, "verified"))),
   ]);
-
   return {
     draws,
     investments,
@@ -44,105 +52,153 @@ async function memberStats(memberId: number) {
   };
 }
 
+async function freshMember(tx: Db, id: number) {
+  const [row] = await tx.select().from(schema.members).where(eq(schema.members.id, id));
+  if (!row) throw new ORPCError("NOT_FOUND", { message: "Member not found" });
+  return row;
+}
+
+async function scoreFile(viewer: Member, target: Member) {
+  const stats = await memberStats(db, target.id);
+  const ageDays = Math.max(0, Math.round((Date.now() - new Date(target.createdAt).getTime()) / 86400000));
+  const trust = trustFactors({
+    decisionsMade: stats.draws.filter((d) => d.decision !== "pending").length,
+    decisionsPending: stats.draws.filter((d) => d.decision === "pending").length,
+    investments: stats.investments.length,
+    tasksApproved: stats.tasksApproved,
+    defaults: stats.defaults,
+    milestonesVerified: stats.milestonesVerified,
+    kycStatus: target.kycStatus,
+    accountAgeDays: ageDays,
+  });
+  if (trust.score !== target.trustScore) {
+    await db.update(schema.members).set({ trustScore: trust.score }).where(eq(schema.members.id, target.id));
+  }
+  return {
+    self: target.id === viewer.id,
+    handle: target.handle,
+    displayName: target.displayName,
+    trust: { ...trust, band: scoreBand(trust.score) },
+    social: {
+      score: target.socialScore,
+      band: scoreBand(target.socialScore),
+      factors: [
+        { label: "Clout", detail: "Earned by marketing and diligence others acted on", points: target.clout, max: 2000 },
+        { label: "Verdict weight", detail: "How often your try/bye call matched the outcome", points: Math.round(target.socialScore / 10), max: 100 },
+      ],
+    },
+    visibility:
+      "Scores are private. You always see your own file. Looking up another handle needs administrator-approved simulated accreditation — paid levels do not grant it — and every lookup is logged to that member.",
+  };
+}
+
 export const members = {
-  /** Create a passport. No password in this build — identity is a demo handle. */
-  join: base
+  /** The caller's account and passport (both null when signed out). Safe to call anonymously. */
+  me: publicProc.handler(({ context }) => ({
+    user: context.user ? { id: context.user.id, email: context.user.email, name: context.user.name } : null,
+    member: context.member,
+  })),
+
+  /**
+   * First-time passport for the signed-in account. Never claims an existing passport —
+   * seeded/QA passports stay unclaimed, and accounts are never matched by email.
+   */
+  onboard: signedIn
     .input(
       z.object({
-        displayName: z.string().min(2).max(60),
-        handle: z
-          .string()
-          .min(3)
-          .max(24)
-          .regex(/^[a-z0-9_]+$/, "lowercase letters, numbers and underscores only"),
-        email: z.string().email(),
+        displayName: z.string().trim().min(2).max(60),
+        handle: z.string().trim().toLowerCase().min(3).max(24).regex(/^[a-z0-9_]+$/, "lowercase letters, numbers and underscores only"),
         world: worldEnum.default("underground"),
         homeBrand: brandEnum.default("forge"),
         track: z.enum(["backer", "creator", "both"]).default("both"),
-        bio: z.string().max(280).optional(),
+        bio: z.string().trim().max(280).optional(),
       }),
     )
-    .handler(async ({ input }) => {
-      const existing = await db
-        .select()
-        .from(schema.members)
-        .where(eq(schema.members.handle, input.handle));
-      if (existing.length) {
-        throw new ORPCError("CONFLICT", { message: "That handle is taken" });
-      }
-      const [member] = await db
-        .insert(schema.members)
-        .values({
-          displayName: input.displayName,
-          handle: input.handle,
-          email: input.email,
-          world: input.world,
-          homeBrand: input.homeBrand,
-          role: input.track === "backer" ? "member" : "creator",
-          bio: input.bio ?? null,
-        })
-        .returning();
-      await addNotice({
-        memberId: member.id,
-        kind: "grace",
-        title: "Welcome — nothing here can bankrupt you",
-        body: "Your starting balance is simulated club credit. Level 0 gives you three draws a week, a $10 cap per project, and an answer required before the next draw unlocks.",
-        recoveryPath:
-          "Complete the identity check whenever you like. Skipping it only limits Orbital Works and score lookups.",
-      });
-      return member;
-    }),
+    .handler(({ input, context }) =>
+      audited(actorOf(context), "members.onboard", undefined, async () => {
+        if (context.member) {
+          logDecision("onboard", "Account already owns a passport", { memberId: context.member.id });
+          return context.member;
+        }
+        try {
+          return await runTx("members.onboard", async (tx) => {
+            const [taken] = await tx.select({ id: schema.members.id }).from(schema.members).where(eq(schema.members.handle, input.handle));
+            if (taken) throw new ORPCError("CONFLICT", { message: "That handle is taken" });
+            const [member] = await tx
+              .insert(schema.members)
+              .values({
+                authUserId: context.user.id,
+                email: context.user.email.toLowerCase(),
+                displayName: input.displayName,
+                handle: input.handle,
+                world: input.world,
+                homeBrand: input.homeBrand,
+                role: input.track === "backer" ? "member" : "creator",
+                bio: input.bio || null,
+              })
+              .returning();
+            await tx.insert(schema.walletEntries).values({ memberId: member.id, deltaCents: member.walletCents, balanceAfterCents: member.walletCents, reason: "opening simulated club credit" });
+            await addLedger(tx, { kind: "opening_credit", amountCents: member.walletCents, memberId: member.id, bucket: "member", note: "Opening simulated club credit (no card charged)" });
+            await addNotice(tx, {
+              memberId: member.id,
+              kind: "grace",
+              title: "Welcome — nothing here can bankrupt you",
+              body: "Your starting balance is simulated club credit. Level 0 gives you three draws a week, a $10 cap per project, and an answer required before the next draw unlocks.",
+              recoveryPath: "Request a simulated identity review from your portfolio whenever you like. Skipping it only limits Orbital Works and score lookups.",
+            });
+            await audit(tx, { memberId: member.id, userId: context.user.id }, { action: "members.onboard", outcome: "accepted", targetType: "member", targetId: member.id, summary: `Passport @${member.handle} created` });
+            return member;
+          });
+        } catch (error) {
+          if (isUniqueViolation(error)) {
+            throw new ORPCError("CONFLICT", { message: "That handle or email already belongs to another passport. Pick another handle, or sign in with the account that owns it." });
+          }
+          throw error;
+        }
+      }),
+    ),
 
-  get: base.input(z.object({ memberId: z.number() })).handler(({ input }) => getMember(input.memberId)),
-
-  byHandle: base.input(z.object({ handle: z.string() })).handler(async ({ input }) => {
-    const [member] = await db
-      .select()
-      .from(schema.members)
-      .where(eq(schema.members.handle, input.handle.toLowerCase()));
-    if (!member) throw new ORPCError("NOT_FOUND", { message: "No member with that handle" });
-    return member;
+  /** Public profile card. */
+  get: publicProc.input(z.object({ memberId: z.number().int() })).handler(async ({ input }) => {
+    const [row] = await db.select(publicColumns).from(schema.members).where(eq(schema.members.id, input.memberId));
+    if (!row) throw new ORPCError("NOT_FOUND", { message: "Member not found" });
+    return row;
   }),
 
-  list: base.handler(() =>
-    db.select({
-      id: schema.members.id,
-      handle: schema.members.handle,
-      displayName: schema.members.displayName,
-      role: schema.members.role,
-      level: schema.members.level,
-      walletCents: schema.members.walletCents,
-    }).from(schema.members).orderBy(desc(schema.members.clout)).limit(50),
-  ),
+  byHandle: publicProc.input(z.object({ handle: z.string() })).handler(async ({ input }) => {
+    const [row] = await db.select(publicColumns).from(schema.members).where(eq(schema.members.handle, input.handle.toLowerCase()));
+    if (!row) throw new ORPCError("NOT_FOUND", { message: "No member with that handle" });
+    return row;
+  }),
 
-  setWorld: base
-    .input(z.object({ memberId: z.number(), world: worldEnum }))
-    .handler(async ({ input }) => {
-      await db
-        .update(schema.members)
-        .set({ world: input.world })
-        .where(eq(schema.members.id, input.memberId));
-      return getMember(input.memberId);
-    }),
+  list: publicProc.handler(() => db.select(publicColumns).from(schema.members).orderBy(desc(schema.members.clout)).limit(50)),
+
+  setWorld: memberProc.input(z.object({ world: worldEnum })).handler(async ({ input, context }) => {
+    await db.update(schema.members).set({ world: input.world }).where(eq(schema.members.id, context.member.id));
+    logDecision("theme", "World saved to passport", { memberId: context.member.id, world: input.world });
+    return { world: input.world };
+  }),
 
   /** Dashboard summary for the signed-in passport. */
-  dashboard: base.input(z.object({ memberId: z.number() })).handler(async ({ input }) => {
-    const member = await getMember(input.memberId);
-    const stats = await memberStats(member.id);
+  dashboard: memberProc.handler(async ({ context }) => {
+    const member = await freshMember(db, context.member.id);
+    const stats = await memberStats(db, member.id);
     const cfg = levelConfig(member.level);
     const wk = weekKey();
     const weekDraws = stats.draws.filter((d) => d.weekKey === wk);
-    const pending = weekDraws.find((d) => d.decision === "pending");
+    const pending = stats.draws.find((d) => d.decision === "pending");
 
     const positions = await db
-      .select({
-        investment: schema.investments,
-        project: schema.projects,
-      })
+      .select({ investment: schema.investments, project: schema.projects })
       .from(schema.investments)
       .innerJoin(schema.projects, eq(schema.investments.projectId, schema.projects.id))
-      .where(eq(schema.investments.memberId, member.id))
+      .where(and(eq(schema.investments.memberId, member.id), eq(schema.investments.kind, "primary")))
       .orderBy(desc(schema.investments.createdAt));
+    const [equity] = await db
+      .select({ bp: sql<number>`coalesce(sum(${schema.equityPositions.equityBp}), 0)` })
+      .from(schema.equityPositions)
+      .innerJoin(schema.projects, eq(schema.equityPositions.projectId, schema.projects.id))
+      .where(and(eq(schema.equityPositions.memberId, member.id), sql`${schema.projects.creatorId} <> ${member.id}`));
 
     const investedCents = positions.reduce((s, p) => s + p.investment.amountCents, 0);
     const liveCents = positions
@@ -165,185 +221,90 @@ export const members = {
         count: positions.length,
         investedCents,
         liveCents,
+        heldCents: positions.reduce((s, p) => s + p.investment.heldCents, 0),
         pointsEarned: positions.reduce((s, p) => s + p.investment.pointsAwarded, 0),
-        equityBp: positions.reduce((s, p) => s + p.investment.equityBp, 0),
+        equityBp: Number(equity?.bp ?? 0),
       },
       notices: stats.openNotices,
     };
   }),
 
   /** Private score with every factor spelled out. */
-  scores: base
-    .input(z.object({ memberId: z.number(), targetHandle: z.string().optional() }))
-    .handler(async ({ input }) => {
-      const viewer = await getMember(input.memberId);
-      let target = viewer;
-      if (input.targetHandle && input.targetHandle !== viewer.handle) {
-        const [found] = await db
-          .select()
-          .from(schema.members)
-          .where(eq(schema.members.handle, input.targetHandle.toLowerCase()));
-        if (!found) throw new ORPCError("NOT_FOUND", { message: "No member with that handle" });
-        const allowed = viewer.level >= 4 || viewer.kycStatus === "accredited" || viewer.role === "admin";
-        if (!allowed) {
-          throw new ORPCError("FORBIDDEN", {
-            message:
-              "Score lookups open at the Accredited Circle. Members can always see their own file.",
-          });
-        }
-        target = found;
-        logDecision("scores", "Permitted private lookup", { viewerId: viewer.id, targetId: found.id });
-        await addNotice({ memberId: found.id, kind: "score_lookup", title: "Private score lookup", body: `@${viewer.handle} viewed your private standing file.`, recoveryPath: "In production you can request an access audit from the privacy desk." });
-      }
+  scores: memberProc.input(z.object({ targetHandle: z.string().optional() })).handler(async ({ input, context }) => {
+    const viewer = await freshMember(db, context.member.id);
+    const handle = input.targetHandle?.trim().toLowerCase();
+    if (!handle || handle === viewer.handle) return scoreFile(viewer, viewer);
 
-      const stats = await memberStats(target.id);
-      const ageDays = Math.max(
-        0,
-        Math.round((Date.now() - new Date(target.createdAt).getTime()) / 86400000),
-      );
-      const trust = trustFactors({
-        decisionsMade: stats.draws.filter((d) => d.decision !== "pending").length,
-        decisionsPending: stats.draws.filter((d) => d.decision === "pending").length,
-        investments: stats.investments.length,
-        tasksApproved: stats.tasksApproved,
-        defaults: stats.defaults,
-        milestonesVerified: stats.milestonesVerified,
-        kycStatus: target.kycStatus,
-        accountAgeDays: ageDays,
+    return audited(actorOf(context), "members.scoreLookup", { type: "handle", id: handle }, async () => {
+      if (!isAccredited(viewer)) {
+        throw new ORPCError("FORBIDDEN", {
+          message: "Looking up another member's file needs administrator-approved simulated accreditation. Paid levels and admin roles do not bypass it. Your own file is always open to you.",
+        });
+      }
+      const [target] = await db.select().from(schema.members).where(eq(schema.members.handle, handle));
+      if (!target) throw new ORPCError("NOT_FOUND", { message: "No member with that handle" });
+      await runTx("members.scoreLookup", async (tx) => {
+        await addNotice(tx, { memberId: target.id, kind: "score_lookup", title: "Private score lookup", body: `@${viewer.handle} viewed your private standing file.`, recoveryPath: "Every lookup is logged. Ask the house desk for an access audit at any time." });
+        await audit(tx, actorOf(context), { action: "members.scoreLookup", outcome: "accepted", targetType: "member", targetId: target.id, summary: `Viewed @${target.handle}` });
       });
-
-      await db
-        .update(schema.members)
-        .set({ trustScore: trust.score })
-        .where(eq(schema.members.id, target.id));
-
-      return {
-        self: target.id === viewer.id,
-        handle: target.handle,
-        displayName: target.displayName,
-        trust: { ...trust, band: scoreBand(trust.score) },
-        social: {
-          score: target.socialScore,
-          band: scoreBand(target.socialScore),
-          factors: [
-            { label: "Clout", detail: "Earned by marketing and diligence others acted on", points: target.clout, max: 2000 },
-            { label: "Verdict weight", detail: "How often your try/bye call matched the outcome", points: Math.round(target.socialScore / 10), max: 100 },
-          ],
-        },
-        visibility:
-          "Scores are private. You see your own file in full. Accredited Circle members can look up a handle; every lookup is logged to that member.",
-      };
-    }),
-
-  levelUp: base
-    .input(z.object({ memberId: z.number(), method: z.enum(["fee", "points"]) }))
-    .handler(async ({ input }) => {
-      const member = await getMember(input.memberId);
-      const next = LEVELS[member.level + 1];
-      if (!next) throw new ORPCError("BAD_REQUEST", { message: "Top level already" });
-
-      if (input.method === "points") {
-        if (member.points < next.pointCost) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: `Needs ${next.pointCost} points, you hold ${member.points}`,
-          });
-        }
-        await db
-          .update(schema.members)
-          .set({ points: member.points - next.pointCost, level: next.level })
-          .where(eq(schema.members.id, member.id));
-        await addLedger({
-          kind: "level_up",
-          amountCents: 0,
-          memberId: member.id,
-          bucket: "member",
-          note: `${next.name} unlocked with ${next.pointCost} points`,
-        });
-      } else {
-        await debitWallet(member.id, next.feeCents, `${next.name} unlock`);
-        await db
-          .update(schema.members)
-          .set({ level: next.level })
-          .where(eq(schema.members.id, member.id));
-        await addLedger({
-          kind: "level_up",
-          amountCents: next.feeCents,
-          memberId: member.id,
-          bucket: "house",
-          note: `${next.name} unlock fee`,
-        });
-        await takeHouseFee({
-          amountCents: next.feeCents,
-          feeCents: Math.round(next.feeCents * 0.1),
-          memberId: member.id,
-          note: `${next.name} unlock`,
-        });
-      }
-
-      if (next.level >= 2) {
-        await db
-          .update(schema.members)
-          .set({ ongoingAccess: true })
-          .where(eq(schema.members.id, member.id));
-      }
-      return getMember(member.id);
-    }),
-
-  unlockOngoing: base.input(z.object({ memberId: z.number() })).handler(async ({ input }) => {
-    const member = await getMember(input.memberId);
-    if (member.ongoingAccess) return member;
-    await debitWallet(member.id, ONGOING_UNLOCK_CENTS, "ongoing round access");
-    await db
-      .update(schema.members)
-      .set({ ongoingAccess: true })
-      .where(eq(schema.members.id, member.id));
-    await takeHouseFee({
-      amountCents: ONGOING_UNLOCK_CENTS,
-      feeCents: Math.round(ONGOING_UNLOCK_CENTS * 0.1),
-      memberId: member.id,
-      note: "Ongoing round access",
+      return scoreFile(viewer, target);
     });
-    return getMember(member.id);
   }),
 
-  /** Simulated KYC tiers — the real thing is a vendor handoff, see /compliance. */
-  kyc: base
-    .input(z.object({ memberId: z.number(), tier: z.enum(["verified", "accredited"]) }))
-    .handler(async ({ input }) => {
-      await db
-        .update(schema.members)
-        .set({ kycStatus: input.tier })
-        .where(eq(schema.members.id, input.memberId));
-      await addNotice({
-        memberId: input.memberId,
-        kind: "reinstatement",
-        title: `Identity tier set to ${input.tier} (simulated)`,
-        body: "In production this status is written by the KYC/AML vendor's webhook, not by the platform. Nothing here is a real identity check.",
-        recoveryPath: "If a real check fails, you keep Level 0 access and can appeal with documents.",
-      });
-      return getMember(input.memberId);
-    }),
+  levelUp: memberProc.input(z.object({ method: z.enum(["fee", "points"]), idempotencyKey })).handler(({ input, context }) => {
+    const { idempotencyKey: key, ...payload } = input;
+    return audited(actorOf(context), "members.levelUp", undefined, () =>
+      once({ memberId: context.member.id, scope: "members.levelUp", key, payload }, async (tx) => {
+        const member = await freshMember(tx, context.member.id);
+        const next = LEVELS[member.level + 1];
+        if (!next) throw new ORPCError("BAD_REQUEST", { message: "Top level already" });
 
-  topUp: base
-    .input(z.object({ memberId: z.number(), amountCents: z.number().min(100).max(100000) }))
-    .handler(async ({ input }) => {
-      const member = await getMember(input.memberId);
-      await db
-        .update(schema.members)
-        .set({ walletCents: member.walletCents + input.amountCents })
-        .where(eq(schema.members.id, member.id));
-      await addLedger({
-        kind: "investment",
-        amountCents: input.amountCents,
-        memberId: member.id,
-        bucket: "member",
-        note: "Simulated club credit top-up (no card charged)",
-      });
-      return getMember(member.id);
-    }),
+        if (input.method === "points") {
+          await spendPoints(tx, member.id, next.pointCost, `${next.name} unlock`);
+          await addLedger(tx, { kind: "level_up", amountCents: 0, memberId: member.id, bucket: "member", note: `${next.name} unlocked with ${next.pointCost} points` });
+        } else {
+          await chargeService(tx, { kind: "level_up", amountCents: next.feeCents, memberId: member.id, note: `${next.name} unlock fee` });
+        }
+        // Conditional on the level we read, so two concurrent upgrades cannot skip a tier.
+        const [updated] = await tx
+          .update(schema.members)
+          .set({ level: next.level, ...(next.level >= 2 ? { ongoingAccess: true } : {}) })
+          .where(and(eq(schema.members.id, member.id), eq(schema.members.level, member.level)))
+          .returning();
+        if (!updated) throw new ORPCError("CONFLICT", { message: "Your level changed while this was processing. Refresh and try again." });
+        await audit(tx, actorOf(context), { action: "members.levelUp", outcome: "accepted", targetType: "member", targetId: member.id, summary: `L${member.level} → L${next.level} via ${input.method}` });
+        logDecision("levels", "Level raised", { memberId: member.id, level: next.level, method: input.method });
+        return { level: updated.level, name: next.name, method: input.method };
+      }),
+    );
+  }),
 
-  leaderboard: base.handler(async () => {
-    const rows = await db
+  unlockOngoing: memberProc.input(z.object({ idempotencyKey })).handler(({ input, context }) =>
+    audited(actorOf(context), "members.unlockOngoing", undefined, () =>
+      once({ memberId: context.member.id, scope: "members.unlockOngoing", key: input.idempotencyKey, payload: {} }, async (tx) => {
+        const [claimed] = await tx
+          .update(schema.members)
+          .set({ ongoingAccess: true })
+          .where(and(eq(schema.members.id, context.member.id), eq(schema.members.ongoingAccess, false)))
+          .returning({ id: schema.members.id });
+        if (!claimed) {
+          logDecision("access", "Ongoing access already held; nothing charged", { memberId: context.member.id });
+          return { ongoingAccess: true, chargedCents: 0 };
+        }
+        await chargeService(tx, { kind: "ongoing_unlock", amountCents: ONGOING_UNLOCK_CENTS, memberId: context.member.id, note: "Ongoing round access" });
+        await audit(tx, actorOf(context), { action: "members.unlockOngoing", outcome: "accepted", targetType: "member", targetId: context.member.id, summary: "Ongoing access unlocked" });
+        return { ongoingAccess: true, chargedCents: ONGOING_UNLOCK_CENTS };
+      }),
+    ),
+  ),
+
+  /** My own wallet movements since the authenticated ledger shipped. */
+  walletHistory: memberProc.handler(({ context }) =>
+    db.select().from(schema.walletEntries).where(eq(schema.walletEntries.memberId, context.member.id)).orderBy(desc(schema.walletEntries.id)).limit(60),
+  ),
+
+  leaderboard: publicProc.handler(() =>
+    db
       .select({
         id: schema.members.id,
         handle: schema.members.handle,
@@ -355,7 +316,6 @@ export const members = {
       })
       .from(schema.members)
       .orderBy(desc(schema.members.clout))
-      .limit(12);
-    return rows;
-  }),
+      .limit(12),
+  ),
 };

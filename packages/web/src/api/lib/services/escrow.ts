@@ -1,4 +1,4 @@
-import { and, eq, gt, sql } from "drizzle-orm";
+import { and, eq, gt } from "drizzle-orm";
 import * as schema from "../../database/schema";
 import { CANCEL_CLAWBACK_RATE } from "../economy";
 import { logDecision } from "../log";
@@ -28,7 +28,7 @@ async function drain(tx: Db, investmentId: number, status: string) {
     .update(schema.investments)
     .set({ heldCents: 0, escrowStatus: status })
     .where(and(eq(schema.investments.id, investmentId), gt(schema.investments.heldCents, 0)))
-    .returning({ before: sql<number>`${schema.investments.amountCents} - ${schema.investments.houseFeeCents}` });
+    .returning({ id: schema.investments.id });
   return row ? 1 : 0;
 }
 
